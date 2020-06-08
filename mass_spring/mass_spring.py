@@ -1,293 +1,39 @@
-from mass_spring_robot_config import robots
 import random
 import sys
-from scipy.ndimage.filters import gaussian_filter
-
 import taichi as tc
 import matplotlib.pyplot as plt
 import taichi as ti
 import math
 import numpy as np
 import os
+import time
 
-real = ti.f32
-ti.init(default_fp=real)
+from tensorboardX import SummaryWriter
+from mass_spring_robot_config import robots
+from scipy.ndimage.filters import gaussian_filter
 
-max_steps = 4096
-vis_interval = 256
-output_vis_interval = 8
-steps = 2048 // 3
-assert steps * 2 <= max_steps
 
-vis_resolution = 1024
+### INITIALIZATION ###
+np.random.seed(0)
+random.seed(0)
+ti.init(arch=ti.gpu, default_fp=ti.f32)
 
+
+### DATA TYPE SHORTCUTS ###
+real   = ti.f32
 scalar = lambda: ti.var(dt=real)
-vec = lambda: ti.Vector(2, dt=real)
+vec    = lambda: ti.Vector(2, dt=real)
 
-loss = scalar()
 
-x = vec()
-v = vec()
-v_inc = vec()
-
-head_id = 0
-goal = vec()
-
+### ROBOT CONFIGURATION (will be sinked down below) ###
 n_objects = 0
-# target_ball = 0
-elasticity = 0.0
-ground_height = 0.1
-gravity = -4.8
-friction = 2.5
-
-gradient_clip = 1
-spring_omega = 10
-damping = 15
-
 n_springs = 0
-spring_anchor_a = ti.var(ti.i32)
-spring_anchor_b = ti.var(ti.i32)
-spring_length = scalar()
-spring_stiffness = scalar()
-spring_actuation = scalar()
-
-n_sin_waves = 10
-weights1 = scalar()
-bias1 = scalar()
-
-n_hidden = 32
-weights2 = scalar()
-bias2 = scalar()
-hidden = scalar()
-
-center = vec()
-
-act = scalar()
-
-
-def n_input_states():
-  return n_sin_waves + 4 * n_objects + 2
-
-
-@ti.layout
-def place():
-  ti.root.dense(ti.l, max_steps).dense(ti.i, n_objects).place(x, v, v_inc)
-  ti.root.dense(ti.i, n_springs).place(spring_anchor_a, spring_anchor_b,
-                                       spring_length, spring_stiffness,
-                                       spring_actuation)
-  ti.root.dense(ti.ij, (n_hidden, n_input_states())).place(weights1)
-  ti.root.dense(ti.i, n_hidden).place(bias1)
-  ti.root.dense(ti.ij, (n_springs, n_hidden)).place(weights2)
-  ti.root.dense(ti.i, n_springs).place(bias2)
-  ti.root.dense(ti.ij, (max_steps, n_hidden)).place(hidden)
-  ti.root.dense(ti.ij, (max_steps, n_springs)).place(act)
-  ti.root.dense(ti.i, max_steps).place(center)
-  ti.root.place(loss, goal)
-  ti.root.lazy_grad()
-
-
-dt = 0.004
-learning_rate = 25
-
-
-@ti.kernel
-def compute_center(t: ti.i32):
-  for _ in range(1):
-    c = ti.Vector([0.0, 0.0])
-    for i in ti.static(range(n_objects)):
-      c += x[t, i]
-    center[t] = (1.0 / n_objects) * c
-
-
-@ti.kernel
-def nn1(t: ti.i32):
-  # Input:
-  #   - Current dt in terms of 10 sinusoids
-  #   - Offset of every object with respect to the center
-  #   - Velocity of every object
-  #   - Vector to the goal position (can be omitted -- stil works)
-  # Notes
-  #   - Without current deltatime in terms of sinusoids - gradients explode
-  #   - Without multiplication to 0.05 - gradients explode again
-
-  for i in range(n_hidden):
-    actuation = 0.0
-    for j in ti.static(range(n_sin_waves)):
-      actuation += weights1[i, j] * ti.sin(spring_omega * t * dt +
-                                           2 * math.pi / n_sin_waves * j)
-    for j in ti.static(range(n_objects)):
-      offset = x[t, j] - center[t]
-      # use a smaller weight since there are too many of them
-      actuation += weights1[i, j * 4 + n_sin_waves] * offset[0] * 0.05
-      actuation += weights1[i, j * 4 + n_sin_waves + 1] * offset[1] * 0.05
-      actuation += weights1[i, j * 4 + n_sin_waves + 2] * v[t, i][0] * 0.05
-      actuation += weights1[i, j * 4 + n_sin_waves + 3] * v[t, i][1] * 0.05
-    #actuation += weights1[i, n_objects * 4 + n_sin_waves] * (
-    #    goal[None][0] - center[t][0])
-    #actuation += weights1[i, n_objects * 4 + n_sin_waves + 1] * (
-    #    goal[None][1] - center[t][1])
-    actuation += bias1[i]
-    actuation = ti.tanh(actuation)
-    hidden[t, i] = actuation
-
-
-@ti.kernel
-def nn2(t: ti.i32):
-  for i in range(n_springs):
-    actuation = 0.0
-    for j in ti.static(range(n_hidden)):
-      actuation += weights2[i, j] * hidden[t, j]
-    actuation += bias2[i]
-    actuation = ti.tanh(actuation)
-    act[t, i] = actuation
-
-
-@ti.kernel
-def apply_spring_force(t: ti.i32):
-  for i in range(n_springs):
-    a = spring_anchor_a[i]
-    b = spring_anchor_b[i]
-    pos_a = x[t, a]
-    pos_b = x[t, b]
-    dist = pos_a - pos_b
-    length = dist.norm() + 1e-4
-
-    target_length = spring_length[i] * (1.0 + spring_actuation[i] * act[t, i])
-    impulse = dt * (
-        length - target_length) * spring_stiffness[i] / length * dist
-
-    ti.atomic_add(v_inc[t + 1, a], -impulse)
-    ti.atomic_add(v_inc[t + 1, b], impulse)
-
-
-use_toi = False
-
-
-@ti.kernel
-def advance_toi(t: ti.i32):
-  for i in range(n_objects):
-    s = math.exp(-dt * damping)
-    old_v = s * v[t - 1, i] + dt * gravity * ti.Vector([0.0, 1.0]) + v_inc[t, i]
-    old_x = x[t - 1, i]
-    new_x = old_x + dt * old_v
-    toi = 0.0
-    new_v = old_v
-    if new_x[1] < ground_height and old_v[1] < -1e-4:
-      toi = -(old_x[1] - ground_height) / old_v[1]
-      new_v = ti.Vector([0.0, 0.0])
-    new_x = old_x + toi * old_v + (dt - toi) * new_v
-
-    v[t, i] = new_v
-    x[t, i] = new_x
-
-
-@ti.kernel
-def advance_no_toi(t: ti.i32):
-  for i in range(n_objects):
-    s = math.exp(-dt * damping)
-    old_v = s * v[t - 1, i] + dt * gravity * ti.Vector([0.0, 1.0]) + v_inc[t, i]
-    old_x = x[t - 1, i]
-    new_v = old_v
-    depth = old_x[1] - ground_height
-    if depth < 0 and new_v[1] < 0:
-      # friction projection
-      new_v[0] = 0
-      new_v[1] = 0
-    new_x = old_x + dt * new_v
-    v[t, i] = new_v
-    x[t, i] = new_x
-
-
-@ti.kernel
-def compute_loss(t: ti.i32):
-  loss[None] = -x[t, head_id][0]
-
-
-gui = tc.core.GUI("Mass Spring Robot", tc.veci(1024, 1024))
-canvas = gui.get_canvas()
-
-def forward(output=None, visualize=True):
-  if random.random() > 0.5:
-    goal[None] = [0.9, 0.2]
-  else:
-    goal[None] = [0.1, 0.2]
-  goal[None] = [0.9, 0.2]
-
-  interval = vis_interval
-  if output:
-    interval = output_vis_interval
-    os.makedirs('mass_spring/{}/'.format(output), exist_ok=True)
-
-  total_steps = steps if not output else steps * 2
-
-  for t in range(1, total_steps):
-    compute_center(t - 1)
-    nn1(t - 1)
-    nn2(t - 1)
-    apply_spring_force(t - 1)
-    if use_toi:
-      advance_toi(t)
-    else:
-      advance_no_toi(t)
-
-    if (t + 1) % interval == 0 and visualize:
-      canvas.clear(0xFFFFFF)
-      canvas.path(tc.vec(0, ground_height),
-                  tc.vec(1, ground_height)).color(0x0).radius(3).finish()
-
-      def circle(x, y, color):
-        canvas.circle(tc.vec(x, y)).color(ti.rgb_to_hex(color)).radius(7).finish()
-
-      for i in range(n_springs):
-
-        def get_pt(x):
-          return tc.vec(x[0], x[1])
-
-        a = act[t - 1, i] * 0.5
-        r = 2
-        if spring_actuation[i] == 0:
-          a = 0
-          c = 0x222222
-        else:
-          r = 4
-          c = ti.rgb_to_hex((0.5 + a, 0.5 - abs(a), 0.5 - a))
-        canvas.path(
-            get_pt(x[t, spring_anchor_a[i]]),
-            get_pt(x[t, spring_anchor_b[i]])).color(c).radius(r).finish()
-
-      for i in range(n_objects):
-        color = (0.4, 0.6, 0.6)
-        if i == head_id:
-          color = (0.8, 0.2, 0.3)
-        circle(x[t, i][0], x[t, i][1], color)
-      # circle(goal[None][0], goal[None][1], (0.6, 0.2, 0.2))
-
-      gui.update()
-      if output:
-        gui.screenshot('mass_spring/{}/{:04d}.png'.format(output, t))
-
-  loss[None] = 0
-  compute_loss(steps - 1)
-
-
-@ti.kernel
-def clear_states():
-  for t in range(0, max_steps):
-    for i in range(0, n_objects):
-      x.grad[t, i] = ti.Vector([0.0, 0.0])
-      v.grad[t, i] = ti.Vector([0.0, 0.0])
-      v_inc[t, i] = ti.Vector([0.0, 0.0])
-      v_inc.grad[t, i] = ti.Vector([0.0, 0.0])
-
-
-def clear():
-  clear_states()
-
-
 def setup_robot(objects, springs):
   global n_objects, n_springs
   n_objects = len(objects)
   n_springs = len(springs)
+
+  print(n_objects)
 
   print('n_objects=', n_objects, '   n_springs=', n_springs)
 
@@ -303,58 +49,334 @@ def setup_robot(objects, springs):
     spring_actuation[i] = s[4]
 
 
-def optimize(toi, visualize):
-  global use_toi
-  use_toi = toi
-  for i in range(n_hidden):
+### SIMULATION PARAMETERS ###
+GROUND_HEIGHT = 0.1
+GRAVITY = -4.8
+MAX_STEPS = 4096
+dt = 0.004
+
+
+### POLICY HYPERPARAMETERS ###
+N_SIN_WAVES = 10
+N_HIDDEN = 32
+
+
+### TRAINING HYPERPARAMETERS ###
+SIMULATION_TRAINING_STEPS = 2048 // 3
+TRAINING_EPOCHS = 100
+LEARNING_RATE   = 0.1
+USE_TIME_OF_IMPACT = True
+SPRING_OMEGA = 10
+DAMPING      = 15
+
+
+### DATA ###
+loss  = scalar()
+x     = vec()
+v     = vec()
+v_inc = vec()
+spring_anchor_a = ti.var(ti.i32)
+spring_anchor_b = ti.var(ti.i32)
+spring_length = scalar()
+spring_stiffness = scalar()
+spring_actuation = scalar()
+weights1 = scalar()
+bias1 = scalar()
+weights2 = scalar()
+bias2 = scalar()
+hidden = scalar()
+center = vec()
+act = scalar()
+
+HEAD_ID = 0
+
+
+def n_input_states():
+  return N_SIN_WAVES + 4 * n_objects + 2
+
+
+### DATA LAYOUT CONFIGURATION (for faster computation) ###
+@ti.layout
+def place():
+  ti.root.dense(ti.l, MAX_STEPS).dense(ti.i, n_objects).place(x, v, v_inc)
+  ti.root.dense(ti.i, n_springs).place(spring_anchor_a, spring_anchor_b,
+                                       spring_length, spring_stiffness,
+                                       spring_actuation)
+  ti.root.dense(ti.ij, (N_HIDDEN, n_input_states())).place(weights1)
+  ti.root.dense(ti.i, N_HIDDEN).place(bias1)
+  ti.root.dense(ti.ij, (n_springs, N_HIDDEN)).place(weights2)
+  ti.root.dense(ti.i, n_springs).place(bias2)
+  ti.root.dense(ti.ij, (MAX_STEPS, N_HIDDEN)).place(hidden)
+  ti.root.dense(ti.ij, (MAX_STEPS, n_springs)).place(act)
+  ti.root.dense(ti.i, MAX_STEPS).place(center)
+  ti.root.place(loss)
+
+  # Add gradient variables
+  ti.root.lazy_grad()
+
+
+### ENVIRONMENT SYSTEMS ###
+@ti.kernel
+def compute_center_of_mass(t: ti.i32):
+  for _ in range(1):
+    c = ti.Vector([0.0, 0.0])
+    for i in ti.static(range(n_objects)):
+      c += x[t, i]
+    center[t] = (1.0 / n_objects) * c
+
+@ti.kernel
+def apply_spring_force(t: ti.i32):
+  for i in range(n_springs):
+    a = spring_anchor_a[i]
+    b = spring_anchor_b[i]
+    pos_a = x[t, a]
+    pos_b = x[t, b]
+    dist = pos_a - pos_b
+    length = dist.norm() + 1e-4
+
+    target_length = spring_length[i] * (1.0 + spring_actuation[i] * act[t, i])
+    # aka force over time
+    impulse = dt * (length - target_length) * spring_stiffness[i] / length * dist
+
+    ti.atomic_add(v_inc[t + 1, a], -impulse)
+    ti.atomic_add(v_inc[t + 1, b], impulse)
+
+@ti.kernel
+def advance_toi(t: ti.i32):
+  for i in range(n_objects):
+    s = math.exp(-dt * DAMPING)
+    old_v = s * v[t - 1, i] + dt * GRAVITY * ti.Vector([0.0, 1.0]) + v_inc[t, i]
+    old_x = x[t - 1, i]
+    new_x = old_x + dt * old_v
+    toi = 0.0
+    new_v = old_v
+    if new_x[1] < GROUND_HEIGHT and old_v[1] < -1e-4:
+      toi = -(old_x[1] - GROUND_HEIGHT) / old_v[1]
+      new_v = ti.Vector([0.0, 0.0])
+    new_x = old_x + toi * old_v + (dt - toi) * new_v
+
+    v[t, i] = new_v
+    x[t, i] = new_x
+
+@ti.kernel
+def advance_no_toi(t: ti.i32):
+  for i in range(n_objects):
+    # Semi-Implicit Euler
+    s = math.exp(-dt * DAMPING)
+    old_v = s * v[t - 1, i] + dt * GRAVITY * ti.Vector([0.0, 1.0]) + v_inc[t, i]
+    old_x = x[t - 1, i]
+    new_v = old_v
+
+    # Ground collision detection
+    depth = old_x[1] - GROUND_HEIGHT
+    if depth < 0 and new_v[1] < 0:
+      # friction projection
+      new_v[0] = 0
+      new_v[1] = 0
+
+    # Semi-Implicit Euler Cont.
+    new_x = old_x + dt * new_v
+    v[t, i] = new_v
+    x[t, i] = new_x
+
+
+### POLICY SYSTEMS ###
+@ti.kernel
+def policy_compute_layer1(t: ti.i32):
+  """
+  Input:
+    - Current dt in terms of 10 sinusoids
+    - Offset of every object with respect to the center
+    - Velocity of every object
+  Notes
+    - Without current deltatime in terms of sinusoids - gradients explode
+    - Without multiplication to 0.05 - gradients explode again
+  """
+  for i in range(N_HIDDEN):
+    actuation = 0.0
+
+    # Sinusoids
+    for j in ti.static(range(N_SIN_WAVES)):
+     actuation += weights1[i, j] * ti.sin(SPRING_OMEGA * t * dt +
+                                         2 * math.pi / N_SIN_WAVES * j)
+
+    # Objects
+    for j in ti.static(range(n_objects)):
+      offset = x[t, j] - center[t]
+
+      # use a smaller weight since there are too many of them
+      actuation += weights1[i, j * 4 + N_SIN_WAVES] * offset[0] * 0.05
+      actuation += weights1[i, j * 4 + N_SIN_WAVES + 1] * offset[1] * 0.05
+      actuation += weights1[i, j * 4 + N_SIN_WAVES + 2] * v[t, j][0] * 0.05
+      actuation += weights1[i, j * 4 + N_SIN_WAVES + 3] * v[t, j][1] * 0.05
+    
+    actuation += bias1[i]
+    actuation = ti.tanh(actuation)
+    hidden[t, i] = actuation
+
+@ti.kernel
+def policy_compute_layer2(t: ti.i32):
+  for i in range(n_springs):
+    actuation = 0.0
+    for j in ti.static(range(N_HIDDEN)):
+      actuation += weights2[i, j] * hidden[t, j]
+    actuation += bias2[i]
+    actuation = ti.tanh(actuation)
+    act[t, i] = actuation
+
+def policy_init_network():
+  """
+    Xavier initialization of the policy network
+  """
+  for i in range(N_HIDDEN):
     for j in range(n_input_states()):
-      weights1[i, j] = np.random.randn() * math.sqrt(
-          2 / (n_hidden + n_input_states())) * 2
+      # Xavier Normal Init
+      gain = 1.0
+      std  = math.sqrt(2 / float(N_HIDDEN + n_input_states())) * gain
+      weights1[i, j] = np.random.randn() * std
 
   for i in range(n_springs):
-    for j in range(n_hidden):
-      # TODO: n_springs should be n_actuators
-      weights2[i, j] = np.random.randn() * math.sqrt(2 /
-                                                     (n_hidden + n_springs)) * 3
+    for j in range(N_HIDDEN):
+      # Xavier Normal Init
+      gain = 1.0
+      std  = math.sqrt(2 / float(N_HIDDEN + n_springs)) * gain
+      weights2[i, j] = np.random.randn() * std
 
-  losses = []
-  # forward('initial{}'.format(robot_id), visualize=visualize)
-  for iter in range(100):
-    clear()
 
+### VISUALISATION SYSTEMS ###
+VIS_INTERVAL = 128
+gui          = tc.core.GUI("Mass Spring Robot", tc.veci(1024, 1024))
+canvas       = gui.get_canvas()
+
+def render_frame(t):
+    canvas.clear(0xFFFFFF)
+    canvas.path(tc.vec(0, GROUND_HEIGHT),
+                tc.vec(1, GROUND_HEIGHT)).color(0x0).radius(3).finish()
+
+    def circle(x, y, color):
+      canvas.circle(tc.vec(x, y)).color(ti.rgb_to_hex(color)).radius(7).finish()
+
+    for i in range(n_springs):
+      def get_pt(x):
+        return tc.vec(x[0], x[1])
+
+      a = act[t - 1, i] * 0.5
+      r = 2
+      if spring_actuation[i] == 0:
+        a = 0
+        c = 0x222222
+      else:
+        r = 4
+        c = ti.rgb_to_hex((0.5 + a, 0.5 - abs(a), 0.5 - a))
+      canvas.path(
+          get_pt(x[t, spring_anchor_a[i]]),
+          get_pt(x[t, spring_anchor_b[i]])).color(c).radius(r).finish()
+
+    for i in range(n_objects):
+      color = (0.4, 0.6, 0.6)
+      if i == HEAD_ID:
+        color = (0.8, 0.2, 0.3)
+      circle(x[t, i][0], x[t, i][1], color)
+
+    gui.update()
+
+
+### TRAINING SYSTEMS ###
+@ti.kernel
+def compute_loss(t: ti.i32):
+  loss[None] = -x[t, HEAD_ID][0]
+
+@ti.kernel
+def clear_states():
+  for t in range(0, MAX_STEPS):
+    for i in range(0, n_objects):
+      x.grad[t, i] = ti.Vector([0.0, 0.0])
+      v.grad[t, i] = ti.Vector([0.0, 0.0])
+      v_inc[t, i] = ti.Vector([0.0, 0.0])
+      v_inc.grad[t, i] = ti.Vector([0.0, 0.0])
+
+  for i in range(N_HIDDEN):
+    for j in range(n_input_states()):
+      weights1.grad[i, j] = 0.0
+    bias1.grad[i] = 0.0
+
+  for i in range(n_springs):
+    for j in range(N_HIDDEN):
+      weights2.grad[i, j] = 0.0
+    bias2.grad[i] = 0.0
+
+def forward(output=None, visualize=True, visualize_sleep=None):
+  interval = VIS_INTERVAL
+  total_steps = SIMULATION_TRAINING_STEPS if not output else MAX_STEPS
+
+  for t in range(1, total_steps):
+    # 1. Simulation step
+    compute_center_of_mass(t - 1)
+    policy_compute_layer1(t - 1)
+    policy_compute_layer2(t - 1)
+    apply_spring_force(t - 1)
+
+    if USE_TIME_OF_IMPACT:
+      advance_toi(t)
+    else:
+      advance_no_toi(t)
+
+    # 2. Rendering (at a given interval)
+    if (t + 1) % interval == 0 and visualize:
+      # Limit the frame rate for visualisation purposes
+      if visualize_sleep is not None:
+        time.sleep(visualize_sleep)
+
+      render_frame(t)
+
+  # 3. Loss to optimize for
+  loss[None] = 0
+  compute_loss(total_steps - 1)
+
+
+def train(visualize):
+  # Logging
+  writer = SummaryWriter()
+
+  # Initialize the policy network
+  policy_init_network()
+
+  for iter in range(TRAINING_EPOCHS):
+    clear_states()
+
+    # Forward pass and gradient tracking
     with ti.Tape(loss):
       forward(visualize=visualize)
 
     print('Iter=', iter, 'Loss=', loss[None])
+    writer.add_scalar("Loss", loss[None], iter)
 
+    # Compute L2 norm of the weights
     total_norm_sqr = 0
-    for i in range(n_hidden):
+    for i in range(N_HIDDEN):
       for j in range(n_input_states()):
         total_norm_sqr += weights1.grad[i, j]**2
       total_norm_sqr += bias1.grad[i]**2
 
     for i in range(n_springs):
-      for j in range(n_hidden):
+      for j in range(N_HIDDEN):
         total_norm_sqr += weights2.grad[i, j]**2
       total_norm_sqr += bias2.grad[i]**2
 
     print(total_norm_sqr)
 
-    # scale = learning_rate * min(1.0, gradient_clip / total_norm_sqr ** 0.5)
-    gradient_clip = 0.2
-    scale = gradient_clip / (total_norm_sqr**0.5 + 1e-6)
-    for i in range(n_hidden):
+    # Optimization algorithm step, important trick -- gradient normalization (used in RNNs)
+    scale = LEARNING_RATE / (total_norm_sqr**0.5 + 1e-6)
+    for i in range(N_HIDDEN):
       for j in range(n_input_states()):
         weights1[i, j] -= scale * weights1.grad[i, j]
       bias1[i] -= scale * bias1.grad[i]
 
     for i in range(n_springs):
-      for j in range(n_hidden):
+      for j in range(N_HIDDEN):
         weights2[i, j] -= scale * weights2.grad[i, j]
       bias2[i] -= scale * bias2.grad[i]
-    losses.append(loss[None])
 
-  return losses
 
 
 robot_id = 0
@@ -366,40 +388,16 @@ else:
   robot_id = int(sys.argv[1])
   task = sys.argv[2]
 
-
 def main():
-
+  # Configure the robot of interest
   setup_robot(*robots[robot_id]())
 
-  if task == 'plot':
-    ret = {}
-    for toi in [False, True]:
-      ret[toi] = []
-      for i in range(5):
-        losses = optimize(toi=toi, visualize=False)
-        # losses = gaussian_filter(losses, sigma=3)
-        plt.plot(losses, 'g' if toi else 'r')
-        ret[toi].append(losses)
+  # Start optimization
+  train(visualize=True)
 
-    import pickle
-    pickle.dump(ret, open('losses.pkl', 'wb'))
-    print("Losses saved to losses.pkl")
-  else:
-    optimize(toi=True, visualize=True)
-
-    # Test original problem
-    clear()
-    forward('Robot-{}, Original Stiffness (3e4)'.format(robot_id))
-
-    # Test for different spring stiffnesses
-    for stiffness in [2.5e4, 3.5e4]:
-      try:
-        for i in range(spring_stiffness.shape()[0]):
-          spring_stiffness[i] = stiffness
-        clear()
-        forward('Robot-{}, Original Stiffness ({})'.format(robot_id, stiffness))
-      except Exception:
-        pass
+  # Test original problem
+  clear_states()
+  forward('Robot-{}, Original Stiffness (3e4)'.format(robot_id), visualize=True, visualize_sleep=0.016)
 
 
 if __name__ == '__main__':
