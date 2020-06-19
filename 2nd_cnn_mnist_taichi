@@ -1,0 +1,495 @@
+import mnist
+import taichi as ti
+import numpy as np
+
+# Initialization
+ti.init(arch=ti.cpu, default_fp=ti.f32)  # debug=True
+
+# Data type shortcuts
+real = ti.f32
+scalar = lambda: ti.var(dt=real)
+
+# Number of recognized digits
+N_NUMBERS = 10
+
+# Image size
+WIDTH = 28
+HEIGHT = 28
+DEPTH = 1  # number of color channels
+
+# POLICY HYPERPARAMETERS
+# CONV1 & CONV2
+N_FILTERS = 8
+FILTER_SIZE = 5  # receptive field
+STRIDE = 1
+ZERO_PADDING = 0
+N_BIASES = N_FILTERS
+
+# MAXPOOL
+P_FILTER_SIZE = 2
+P_STRIDE = 2
+
+# Input image size after zero-padding
+w_input = WIDTH + 2 * ZERO_PADDING  # 28
+h_input = HEIGHT + 2 * ZERO_PADDING  # 28
+
+# Size of the output1 (after CONV1)
+w_output1 = int((WIDTH - FILTER_SIZE + 2 * ZERO_PADDING) / STRIDE + 1)  # 24
+h_output1 = int((HEIGHT - FILTER_SIZE + 2 * ZERO_PADDING) / STRIDE + 1)  # 24
+d_output1 = N_FILTERS  # 8
+
+# Size of the output2 (after CONV2)
+w_output2 = int((w_output1 - FILTER_SIZE + 2 * ZERO_PADDING) / STRIDE + 1)  # 20
+h_output2 = int((h_output1 - FILTER_SIZE + 2 * ZERO_PADDING) / STRIDE + 1)  # 20
+d_output2 = N_FILTERS  # 8
+
+# Size of the output3 (after MAXPOOL)
+w_output3 = int((w_output2 - P_FILTER_SIZE) / P_STRIDE + 1)  # 10
+h_output3 = int((h_output2 - P_FILTER_SIZE) / P_STRIDE + 1)  # 10
+d_output3 = d_output2  # 8
+
+# TRAINING HYPERPARAMETERS
+LEARNING_RATE = 0.01
+TRAINING_EPOCHS = 2
+
+# For initialization
+scale = 0.1
+fan_in1 = FILTER_SIZE * FILTER_SIZE * DEPTH
+fan_in2 = FILTER_SIZE * FILTER_SIZE * N_FILTERS
+std1 = scale * ((1. / fan_in1) ** 0.5)
+std2 = scale * ((1. / fan_in2) ** 0.5)
+
+# Data types
+# INPUT
+pixels = scalar()
+input_img = scalar()
+
+# CONV1
+weight_conv1 = scalar()
+bias_conv1 = scalar()
+output_conv1 = scalar()
+output_relu1 = scalar()
+
+# CONV2
+weight_conv2 = scalar()
+bias_conv2 = scalar()
+output_conv2 = scalar()
+output_relu2 = scalar()
+
+# MAXPOOL
+output_pool = scalar()
+
+# FC
+weight_fc = scalar()
+bias_fc = scalar()
+output_fc = scalar()
+output_exp = scalar()
+output_softmax = scalar()
+output_sum = scalar()
+
+# Other
+batch_size = scalar()
+needed = scalar()
+loss = scalar()
+
+
+# Data layout configuration (for faster computation)
+@ti.layout
+def place():
+    # INPUT
+    ti.root.dense(ti.ijk, (WIDTH, HEIGHT, DEPTH)).place(pixels)
+    ti.root.dense(ti.ijk, (w_input, h_input, DEPTH)).place(input_img)
+
+    # CONV1
+    ti.root.dense(ti.ijkl, (FILTER_SIZE, FILTER_SIZE, DEPTH, N_FILTERS)).place(weight_conv1)  # 1 channel
+    ti.root.dense(ti.i, N_FILTERS).place(bias_conv1)
+    ti.root.dense(ti.ijk, (w_output1, h_output1, d_output1)).place(output_conv1)
+    ti.root.dense(ti.ijk, (w_output1, h_output1, d_output1)).place(output_relu1)
+
+    # CONV2
+    ti.root.dense(ti.ijkl, (FILTER_SIZE, FILTER_SIZE, N_FILTERS, N_FILTERS)).place(weight_conv2)  # 8 channels
+    ti.root.dense(ti.i, N_FILTERS).place(bias_conv2)
+    ti.root.dense(ti.ijk, (w_output2, h_output2, d_output2)).place(output_conv2)
+    ti.root.dense(ti.ijk, (w_output2, h_output2, d_output2)).place(output_relu2)
+
+    # MAXPOOL
+    ti.root.dense(ti.ijk, (w_output3, h_output3, d_output3)).place(output_pool)
+
+    # FC
+    ti.root.dense(ti.ijkl, (w_output3, h_output3, d_output3, N_NUMBERS)).place(weight_fc)
+    ti.root.dense(ti.i, N_NUMBERS).place(bias_fc)
+    ti.root.dense(ti.i, N_NUMBERS).place(output_fc)
+    ti.root.dense(ti.i, N_NUMBERS).place(output_exp)
+    ti.root.dense(ti.i, N_NUMBERS).place(output_softmax)
+    ti.root.place(output_sum)
+
+    # Other
+    ti.root.dense(ti.i, N_NUMBERS).place(needed)
+    ti.root.place(batch_size)
+    ti.root.place(loss)
+
+    # Add gradient variables
+    ti.root.lazy_grad()
+
+
+# INPUT - CONV1 - RELU - CONV2 - RELU- MAXPOOL - FC1 - OUT
+
+
+# Zero-padding (in this case input_img is the same as pixels)
+@ti.kernel
+def zero_p():
+    for k in range(DEPTH):
+        for i in range(w_input):
+            for j in range(h_input):
+                input_img[i, j, k] = 0
+
+    for k in range(DEPTH):
+        for i in range(WIDTH):
+            for j in range(HEIGHT):
+                input_img[i + ZERO_PADDING, j + ZERO_PADDING, k] = pixels[i, j, k]
+
+
+# Init network
+@ti.kernel
+def init_net():
+    # CONV1
+    for l in range(N_FILTERS):
+        for k in range(DEPTH):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv1[i, j, k, l] = np.random.normal(loc=0, scale=std1, size=None)
+
+    for i in range(N_FILTERS):
+        bias_conv1[i] = 0
+
+    # CONV2
+    for l in range(N_FILTERS):
+        for k in range(N_FILTERS):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv2[i, j, k, l] = np.random.normal(loc=0, scale=std2, size=None)
+
+    for i in range(N_FILTERS):
+        bias_conv2[i] = 0
+
+    # FC
+    for k in range(d_output3):
+        for i in range(w_output3):
+            for j in range(h_output3):
+                for l in range(N_NUMBERS):
+                    weight_fc[i, j, k, l] = ti.random() * 0.01
+
+    for i in range(N_FILTERS):
+        bias_fc[i] = 0
+
+
+# Clear weights' and biases' gradient
+@ti.kernel
+def clear_weights_biases():
+    # CONV1
+    for l in range(N_FILTERS):
+        for k in range(DEPTH):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv1.grad[i, j, k, l] = 0
+
+    for i in range(N_FILTERS):
+        bias_conv1.grad[i] = 0
+
+    # CONV2
+    for l in range(N_FILTERS):
+        for k in range(N_FILTERS):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv2.grad[i, j, k, l] = 0
+
+    for i in range(N_FILTERS):
+        bias_conv2.grad[i] = 0
+
+    # FC
+    for k in range(d_output3):
+        for i in range(w_output3):
+            for j in range(h_output3):
+                for l in range(N_NUMBERS):
+                    weight_fc.grad[i, j, k, l] = 0
+
+    for i in range(N_FILTERS):
+        bias_fc.grad[i] = 0
+
+
+# Clear outputs
+@ti.kernel
+def clear_outputs():
+    # CONV1
+    for k in range(d_output1):
+        for i in range(w_output1):
+            for j in range(h_output1):
+                output_conv1[i, j, k] = 0
+                output_relu1[i, j, k] = 0
+                output_conv1.grad[i, j, k] = 0
+                output_relu1.grad[i, j, k] = 0
+
+    # CONV2
+    for k in range(d_output2):
+        for i in range(w_output2):
+            for j in range(h_output2):
+                output_conv2[i, j, k] = 0
+                output_relu2[i, j, k] = 0
+                output_conv2.grad[i, j, k] = 0
+                output_relu2.grad[i, j, k] = 0
+
+    # MAXPOOL
+    for k in range(d_output3):
+        for i in range(w_output3):
+            for j in range(h_output3):
+                output_pool[i, j, k] = 0
+                output_pool.grad[i, j, k] = 0
+
+    # FC
+    for i in range(N_NUMBERS):
+        output_fc[i] = 0
+        output_exp[i] = 0
+        output_softmax[i] = 0
+        output_fc.grad[i] = 0
+        output_exp.grad[i] = 0
+        output_softmax.grad[i] = 0
+
+
+# CONV1
+@ti.kernel
+def conv1():
+    for n in range(N_FILTERS):
+        for i in range(WIDTH - FILTER_SIZE + 1):
+            for j in range(HEIGHT - FILTER_SIZE + 1):
+                for l in range(DEPTH):
+                    for k in range(FILTER_SIZE):
+                        for r in range(FILTER_SIZE):
+                            output_conv1[i, j, n] += input_img[i + k, j + r, l] * weight_conv1[k, r, l, n]
+
+    for k in range(d_output1):
+        for i in range(w_output1):
+            for j in range(h_output1):
+                output_conv1[i, j, k] += bias_conv1[k]
+
+
+# CONV1 -> RELU
+@ti.kernel
+def conv1_relu():
+    for k in range(d_output1):
+        for i in range(w_output1):
+            for j in range(h_output1):
+                output_relu1[i, j, k] = ti.max(0, output_conv1[i, j, k])
+
+# CONV2
+@ti.kernel
+def conv2():
+    for n in range(N_FILTERS):
+        for i in range(WIDTH - FILTER_SIZE + 1):
+            for j in range(HEIGHT - FILTER_SIZE + 1):
+                for l in range(N_FILTERS):
+                    for k in range(FILTER_SIZE):
+                        for r in range(FILTER_SIZE):
+                            output_conv2[i, j, n] += output_relu1[i + k, j + r, l] * weight_conv2[k, r, l, n]
+
+    for k in range(d_output2):
+        for i in range(w_output2):
+            for j in range(h_output2):
+                output_conv2[i, j, k] += bias_conv2[k]
+
+
+# CONV2 -> RELU
+@ti.kernel
+def conv2_relu():
+    for k in range(d_output2):
+        for i in range(w_output2):
+            for j in range(h_output2):
+                output_relu2[i, j, k] = ti.max(0, output_conv2[i, j, k])
+
+
+# MAXPOOL
+@ti.kernel
+def pool():
+    for k in range(d_output2):
+        for i in range(0, (w_output2 - 1) // 2):
+            for j in range(0, (h_output2 - 1) // 2):
+                i1 = 2 * i
+                j1 = 2 * j
+                output_pool[i, j, k] = ti.max(ti.max(output_relu2[i1, j1, k], output_relu2[i1 + 1, j1, k]), ti.max(output_relu2[i1, j1 + 1, k], output_relu2[i1 + 1, j1 + 1, k]))
+
+
+# FC
+@ti.kernel
+def fc():
+    for k in range(d_output3):
+        for i in range(w_output3):
+            for j in range(h_output3):
+                for l in range(N_NUMBERS):
+                    output_fc[l] += output_pool[i, j, k] * weight_fc[i, j, k, l]
+
+    for i in range(N_NUMBERS):
+        output_fc[i] += bias_fc[i]
+
+
+# Softmax
+@ti.kernel
+def softmax():
+    for i in range(N_NUMBERS):
+        output_exp[i] = ti.exp(output_fc[i])
+        output_sum[None] += output_exp[i]
+
+    for i in range(N_NUMBERS):
+        output_softmax[i] = output_exp[i] / output_sum[None]
+
+
+# Compute loss (cross-entropy)
+@ti.kernel
+def compute_loss():
+    for i in range(N_NUMBERS):
+        loss[None] += (-needed[i]) * ti.log(output_softmax[i]) + (needed[i] - 1) * ti.log(1 - output_softmax[i])
+
+
+# Gradient descent
+@ti.kernel
+def gd():
+    # CONV1
+    for l in range(N_FILTERS):
+        for k in range(DEPTH):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv1[i, j, k, l] -= LEARNING_RATE * weight_conv1.grad[i, j, k, l] / batch_size[None]
+
+    for i in range(N_FILTERS):
+        bias_conv1[i] -= LEARNING_RATE * bias_conv1.grad[i] / batch_size[None]
+
+    # CONV2
+    for l in range(N_FILTERS):
+        for k in range(N_FILTERS):
+            for i in range(FILTER_SIZE):
+                for j in range(FILTER_SIZE):
+                    weight_conv2[i, j, k, l] -= LEARNING_RATE * weight_conv2.grad[i, j, k, l] / batch_size[None]
+
+    for i in range(N_FILTERS):
+        bias_conv2[i] -= LEARNING_RATE * bias_conv2.grad[i] / batch_size[None]
+
+    # FC
+    for k in range(d_output3):
+        for i in range(w_output3):
+            for j in range(h_output3):
+                for l in range(N_NUMBERS):
+                    weight_fc[i, j, k, l] -= LEARNING_RATE * weight_fc.grad[i, j, k, l] / batch_size[None]
+
+    for i in range(N_FILTERS):
+        bias_fc[i] -= LEARNING_RATE * bias_fc.grad[i] / batch_size[None]
+
+
+# Step forward through CNN
+def forward():
+    conv1()
+    conv1_relu()
+    conv2()
+    conv2_relu()
+    pool()
+    fc()
+    softmax()
+    compute_loss()
+
+
+# Step backward through CNN (for computing grad)
+def backward_grad():
+    compute_loss.grad()
+    softmax.grad()
+    fc.grad()
+    pool.grad()
+    conv2_relu.grad()
+    conv2.grad()
+    conv1_relu.grad()
+    conv1.grad()
+
+
+# MNIST images
+training_images = mnist.train_images()
+training_labels = mnist.train_labels()
+test_images = mnist.test_images()
+test_labels = mnist.test_labels()
+
+
+# Compute accuracy of predictions on tests
+def test_accuracy():
+    n_test = len(test_images) // 100
+    accuracy = 0
+    for n in range(n_test):
+        # Input
+        curr_image = test_images[n]
+        for k in range(DEPTH):
+            for i in range(WIDTH):
+                for j in range(HEIGHT):
+                    pixels[i, j, k] = curr_image[i][j] / 255
+        zero_p()
+        for i in range(N_NUMBERS):
+            needed[i] = int(test_labels[n] == i)
+
+        clear_weights_biases()
+        clear_outputs()
+        output_sum[None] = 0
+        loss[None] = 0
+
+        forward()
+
+        outputs = []
+        for i in range(N_NUMBERS):
+            outputs.append(output_softmax[i])
+        prediction = outputs.index(max(outputs))  # Digit with higher prediction
+        accuracy += int(prediction == test_labels[n])
+
+    return accuracy / n_test
+
+
+# Training
+def main():
+    # Initialize network
+    init_net()
+
+    # Training
+    losses = []
+    accuracies = []
+    for t in range(TRAINING_EPOCHS):
+        for n in range(len(training_images)):
+            batch_size[None] = 1 + t / 10.0
+
+            # Input
+            curr_image = training_images[n]
+            for k in range(DEPTH):
+                for i in range(WIDTH):
+                    for j in range(HEIGHT):
+                        pixels[i, j, k] = curr_image[i][j] / 255
+            zero_p()
+            for i in range(N_NUMBERS):
+                needed[i] = int(training_labels[n] == i)
+
+            clear_weights_biases()
+            clear_outputs()
+            output_sum[None] = 0
+            loss[None] = 0
+
+            forward()
+
+            curr_loss = loss[None]
+            losses.append(curr_loss)
+            losses = losses[-100:]
+            if n % 100 == 0:
+                print('i =', n, ' loss: ', sum(losses) / len(losses))
+            if n % 1000 == 0:
+                curr_acc = test_accuracy()
+                print('test accuracy: {:.2f}%'.format(100 * curr_acc))
+                accuracies.append(curr_acc)
+
+            loss.grad[None] = 1
+            output_sum.grad[None] = 0
+
+            backward_grad()
+
+            gd()
+
+
+if __name__ == '__main__':
+    main()
