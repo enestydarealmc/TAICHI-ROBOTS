@@ -157,7 +157,7 @@ def init_net():
         for k in range(DEPTH):
             for i in range(FILTER_SIZE):
                 for j in range(FILTER_SIZE):
-                    weight_conv1[i, j, k, l] = np.random.normal(loc=0, scale=std1, size=None)
+                    weight_conv1[i, j, k, l] = ti.random() * 0.01  # np.random.normal(loc=0, scale=std1, size=None)
 
     for i in range(N_FILTERS):
         bias_conv1[i] = 0
@@ -167,7 +167,7 @@ def init_net():
         for k in range(N_FILTERS):
             for i in range(FILTER_SIZE):
                 for j in range(FILTER_SIZE):
-                    weight_conv2[i, j, k, l] = np.random.normal(loc=0, scale=std2, size=None)
+                    weight_conv2[i, j, k, l] = ti.random() * 0.01  # np.random.normal(loc=0, scale=std2, size=None)
 
     for i in range(N_FILTERS):
         bias_conv2[i] = 0
@@ -345,7 +345,7 @@ def softmax():
 @ti.kernel
 def compute_loss():
     for i in range(N_NUMBERS):
-        loss[None] += (-needed[i]) * ti.log(output_softmax[i]) + (needed[i] - 1) * ti.log(1 - output_softmax[i])
+        loss[None] += (-needed[i]) * ti.log(output_softmax[i])  # + (needed[i] - 1) * ti.log(1 - output_softmax[i])
 
 
 # Gradient descent
@@ -415,7 +415,7 @@ test_labels = mnist.test_labels()
 
 # Compute accuracy of predictions on tests
 def test_accuracy():
-    n_test = len(test_images) // 100
+    n_test = len(test_images) // 10
     accuracy = 0
     for n in range(n_test):
         # Input
