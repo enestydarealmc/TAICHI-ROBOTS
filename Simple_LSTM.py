@@ -10,8 +10,8 @@ NUM_HIDDEN = 4  # 4 disconnected hidden cells
 NUM_OUTPUT = 1
 NUM_CONCAT = 1 + NUM_INPUT  # 1 is number of input to each hidden cell
 TIME_STEPS = 4  # corresponds to 4 input of x's components
-LR = 0.1
-BATCH_SIZE = 100
+LR = 0.01
+BATCH_SIZE = 10
 PRECISION = 3
 
 scalar = lambda: ti.var(dt=real)
@@ -102,7 +102,7 @@ def concat_input():
 
 
 @ti.func
-def sigmoid(arg: ti.var):
+def sigmoid(arg):
     return 1 / (1 + ti.exp(-arg))
 
 
@@ -122,10 +122,10 @@ def forward_prop():
             f[t, j] = sigmoid(temp_f[t, 0] + bf[j, 0])
             o[t, j] = sigmoid(temp_o[t, 0] + bo[j, 0])
             if t == 0:
-                s[t, j] = g[t, j] * i[t, j]
+                s[t, j] = sigmoid(g[t, j] * i[t, j])
             else:
-                s[t, j] = g[t, j] * i[t, j] + s[t - 1, j] * f[t, j]
-            h[t, j] = s[t, j] * o[t, j]
+                s[t, j] = sigmoid(g[t, j] * i[t, j] + s[t - 1, j] * f[t, j])
+            h[t, j] = ti.tanh(s[t, j]) * o[t, j]
     for j in range(NUM_HIDDEN):
         temp_result[None] += w_result[0, j] * h[TIME_STEPS - 1, j]
     for _ in range(1):
@@ -191,7 +191,7 @@ def print_data(data, a, b):
 
 if __name__ == '__main__':
     generate_sample()
-    for _ in range(1000):
+    for _ in range(10):
         # x.from_numpy(np.array([[0.3], [0.35], [0.4], [0.45]]))
         # y[None] = 0.5
         for k in range(BATCH_SIZE):
